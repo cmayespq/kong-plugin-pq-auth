@@ -24,7 +24,7 @@ function ProQuestAuthHandler:access(conf)
   end
 
   -- Take out the Bearer prefix and strip leading and trailing spaces.
-  local auth_header = string.gsub(auth_header, 'Bearer%s*', ''):match("^%s*(.-)%s*$")
+  local auth_header = string.gsub(auth_header, '[Bb][Ee][Aa][Rr][Ee][Rr]%s*', ''):match("^%s*(.-)%s*$")
 
   log.notice("Authentication header value: ", auth_header)
 
