@@ -1,6 +1,7 @@
 local BasePlugin = require "kong.plugins.base_plugin"
 local responses = require "kong.tools.responses"
 local http = require "resty.http"
+local constants = require "kong.constants"
 local helpers = require "kong.plugins.pq-auth.helpers"
 local log = helpers.log
 local dump = helpers.dump
@@ -9,6 +10,41 @@ local ProQuestAuthHandler = BasePlugin:extend()
 
 function ProQuestAuthHandler:new()
   ProQuestAuthHandler.super.new(self, "pq-auth")
+end
+
+local function set_consumer(consumer, credential)
+  local const = constants.HEADERS
+
+  local new_headers = {
+    [const.CONSUMER_ID] = consumer.id,
+    [const.CONSUMER_CUSTOM_ID] = tostring(consumer.custom_id),
+    [const.CONSUMER_USERNAME] = consumer.username,
+  }
+
+  kong.ctx.shared.authenticated_consumer = consumer -- forward compatibility
+  ngx.ctx.authenticated_consumer = consumer -- backward compatibility
+
+  kong.service.request.set_headers(new_headers)
+end
+
+local function load_consumer_by_username(username)
+  local result, err = kong.db.consumers:select_by_username(username)
+
+  if not result then
+    local inserted_plugin, err = kong.db.consumers:insert({
+      username = username
+    })
+
+    if not inserted_plugin then
+      if not creds then
+        return nil, err
+      end
+    end
+
+    return inserted_plugin
+  end
+
+  return result
 end
 
 function ProQuestAuthHandler:access(conf)
@@ -23,8 +59,7 @@ function ProQuestAuthHandler:access(conf)
     return responses.send_HTTP_BAD_REQUEST("No Authorization header")
   end
 
-  -- Take out the Bearer prefix and strip leading and trailing spaces.
-  local auth_header = string.gsub(auth_header, '[Bb][Ee][Aa][Rr][Ee][Rr]%s*', ''):match("^%s*(.-)%s*$")
+  local auth_header = helpers.strip(string.gsub(auth_header, '[Bb][Ee][Aa][Rr][Ee][Rr]%s*', ''))
 
   log.notice("Authentication header value: ", auth_header)
 
@@ -33,7 +68,7 @@ function ProQuestAuthHandler:access(conf)
   end
 
   local base_url
-  if (helpers.ends_with(conf.url,"/")) then
+  if (helpers.ends_with(conf.url, "/")) then
     base_url = conf.url
   else
     base_url = conf.url .. "/"
@@ -48,7 +83,6 @@ function ProQuestAuthHandler:access(conf)
   log.notice("CALL RESULT: ", dump(res), "err", dump(err))
 
   if not res then
-    log.notice("First 500 with err " .. err)
     return responses.send_HTTP_INTERNAL_SERVER_ERROR(err)
   end
 
@@ -59,7 +93,28 @@ function ProQuestAuthHandler:access(conf)
   if res.status ~= 200 then
     return responses.send_HTTP_UNAUTHORIZED("Invalid auth token")
   end
+
+  local auth_body = res.body
+
+  log.error("Auth body: " .. auth_body)
+  log.error("Body type: " .. type(auth_body))
+
+  local _, _, profile_name = auth_body:find('myResearchProfile>([^<]*)<')
+  profile_name = helpers.strip(profile_name:gsub('/profile/', ''))
+  log.error("Profile name: " .. profile_name)
+
+  local consumer, err = load_consumer_by_username(profile_name)
+
+  log.error("Found consumer: ", helpers.dump(consumer))
+
+  if err then
+    return responses.send_HTTP_INTERNAL_SERVER_ERROR("Problems fetching credentials: " .. err)
+  end
+
+  set_consumer(consumer)
 end
+
+
 
 ProQuestAuthHandler.PRIORITY = 900
 

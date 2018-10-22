@@ -88,6 +88,14 @@ local function isempty(s)
   return s == nil or s == ''
 end
 
+local function strip(s)
+  if isempty(s) then
+    return s
+  end
+
+  return s:match("^%s*(.-)%s*$")
+end
+
 local function keys(t)
   local keyset={}
   local n=0
@@ -110,6 +118,7 @@ return {
   parse_path = parse_path,
   parse_url = parse_url,
   isempty = isempty,
+  strip = strip,
   log = log,
   dump = dump,
   keys = keys,
