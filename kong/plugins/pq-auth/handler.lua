@@ -21,6 +21,7 @@ end
 
 --- Sets consumer (Kong's concept of a user) header data.
 -- @param consumer The consumer object for the request's user.
+--
 local function set_consumer(consumer)
   local const = constants.HEADERS
 
@@ -41,6 +42,7 @@ end
 --- Queries the Kong database for the given user, creating a new entry if nothing found.
 -- @param username The user to search for.
 -- @return The found or created consumer for the given user name.
+--
 local function load_or_create_consumer(username)
   kong.log.debug("Loading consumer for user " .. username)
   local result = kong.db.consumers:select_by_username(username)
@@ -64,6 +66,7 @@ end
 
 ---  Gets the Kong consumer for the given user name.
 -- @param username The name of the user to fetch.
+--
 local function get_consumer_by_username(username)
   local cache = kong.cache
 
@@ -83,6 +86,7 @@ end
 --- Authenticates the requesting user and adds user metadata to the request.
 -- This is the entry point for the plugin.
 -- @param conf The plugin's configuration.
+--
 function ProQuestAuthHandler:access(conf)
   ProQuestAuthHandler.super.access(self)
 
