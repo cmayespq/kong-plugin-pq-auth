@@ -1,45 +1,5 @@
 local url = require "socket.url"
 
---[[
-ngx.STDERR
-ngx.EMERG
-ngx.ALERT
-ngx.CRIT
-ngx.ERR
-ngx.WARN
-ngx.NOTICE
-ngx.INFO
-ngx.DEBUG
-]]
-
-local function log_error(...)
-  ngx.log(ngx.ERR, ...)
-end
-
-local function log_warn(...)
-  ngx.log(ngx.WARN, ...)
-end
-
-local function log_notice(...)
-  ngx.log(ngx.NOTICE, ...)
-end
-
-local function log_info(...)
-  ngx.log(ngx.INFO, ...)
-end
-
-local function log_debug(...)
-  ngx.log(ngx.DEBUG, ...)
-end
-
-local log = {
-  error = log_error,
-  warn  = log_warn,
-  notice = log_notice,
-  info  = log_info,
-  debug = log_debug,
-}
-
 local function dump(t, indent)
   if indent == nil then
     indent = ''
@@ -119,7 +79,6 @@ return {
   parse_url = parse_url,
   isempty = isempty,
   strip = strip,
-  log = log,
   dump = dump,
   keys = keys,
   starts_with = starts_with,

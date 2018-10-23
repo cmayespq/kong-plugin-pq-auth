@@ -1,9 +1,16 @@
+--- Handles ProQuest authentication for Kong proxies.
+-- @module handler
+--
+-- Calls internal services to validate the provided credentials and associates
+-- a Kong consumer with the user to allow for per-user rate limiting and tracking.
+-- Note that the `kong` variable is an implicit global.
+
 local BasePlugin = require "kong.plugins.base_plugin"
 local responses = require "kong.tools.responses"
 local http = require "resty.http"
 local constants = require "kong.constants"
 local helpers = require "kong.plugins.pq-auth.helpers"
-local log = helpers.log
+local log = kong.log
 local dump = helpers.dump
 
 local ProQuestAuthHandler = BasePlugin:extend()
@@ -12,8 +19,12 @@ function ProQuestAuthHandler:new()
   ProQuestAuthHandler.super.new(self, "pq-auth")
 end
 
-local function set_consumer(consumer, credential)
+--- Sets consumer (Kong's concept of a user) header data.
+-- @param consumer The consumer object for the request's user.
+local function set_consumer(consumer)
   local const = constants.HEADERS
+
+  log.info("Setting consumer headers for: ", helpers.dump(consumer))
 
   local new_headers = {
     [const.CONSUMER_ID] = consumer.id,
@@ -27,8 +38,12 @@ local function set_consumer(consumer, credential)
   kong.service.request.set_headers(new_headers)
 end
 
-local function load_consumer_by_username(username)
-  local result, err = kong.db.consumers:select_by_username(username)
+--- Queries the Kong database for the given user, creating a new entry if nothing found.
+-- @param username The user to search for.
+-- @return The found or created consumer for the given user name.
+local function load_or_create_consumer(username)
+  kong.log.debug("Loading consumer for user " .. username)
+  local result = kong.db.consumers:select_by_username(username)
 
   if not result then
     local inserted_plugin, err = kong.db.consumers:insert({
@@ -47,6 +62,27 @@ local function load_consumer_by_username(username)
   return result
 end
 
+---  Gets the Kong consumer for the given user name.
+-- @param username The name of the user to fetch.
+local function get_consumer_by_username(username)
+  local cache = kong.cache
+
+  local consumer_cache_key = kong.db.consumers:cache_key(username)
+
+  local consumer, err = cache:get(consumer_cache_key, nil,
+    load_or_create_consumer, username)
+
+  if err then
+    kong.log.err(err)
+    return nil, { status = 500, message = "Problems fetching consumer info" }
+  end
+
+  return consumer
+end
+
+--- Authenticates the requesting user and adds user metadata to the request.
+-- This is the entry point for the plugin.
+-- @param conf The plugin's configuration.
 function ProQuestAuthHandler:access(conf)
   ProQuestAuthHandler.super.access(self)
 
@@ -61,7 +97,7 @@ function ProQuestAuthHandler:access(conf)
 
   local auth_header = helpers.strip(string.gsub(auth_header, '[Bb][Ee][Aa][Rr][Ee][Rr]%s*', ''))
 
-  log.notice("Authentication header value: ", auth_header)
+  log.debug("Authentication header value: ", auth_header)
 
   if helpers.isempty(auth_header) then
     return responses.send_HTTP_BAD_REQUEST("No Authorization header value")
@@ -76,11 +112,11 @@ function ProQuestAuthHandler:access(conf)
 
   local pqd_url = base_url .. auth_header
 
-  log.notice("PQD URL: ", pqd_url)
+  log.debug("PQD URL: ", pqd_url)
 
   local res, err = client:request_uri(pqd_url)
 
-  log.notice("CALL RESULT: ", dump(res), "err", dump(err))
+  log.debug("CALL RESULT: ", dump(res), "err", dump(err))
 
   if not res then
     return responses.send_HTTP_INTERNAL_SERVER_ERROR(err)
@@ -96,16 +132,10 @@ function ProQuestAuthHandler:access(conf)
 
   local auth_body = res.body
 
-  log.error("Auth body: " .. auth_body)
-  log.error("Body type: " .. type(auth_body))
-
   local _, _, profile_name = auth_body:find('myResearchProfile>([^<]*)<')
-  profile_name = helpers.strip(profile_name:gsub('/profile/', ''))
-  log.error("Profile name: " .. profile_name)
+  local user_name = helpers.strip(profile_name:gsub('/profile/', ''))
 
-  local consumer, err = load_consumer_by_username(profile_name)
-
-  log.error("Found consumer: ", helpers.dump(consumer))
+  local consumer, err = get_consumer_by_username(user_name)
 
   if err then
     return responses.send_HTTP_INTERNAL_SERVER_ERROR("Problems fetching credentials: " .. err)
@@ -113,8 +143,6 @@ function ProQuestAuthHandler:access(conf)
 
   set_consumer(consumer)
 end
-
-
 
 ProQuestAuthHandler.PRIORITY = 900
 
