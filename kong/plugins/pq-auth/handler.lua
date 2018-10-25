@@ -5,6 +5,8 @@
 -- a Kong consumer with the user to allow for per-user rate limiting and tracking.
 -- Note that the `kong` variable is an implicit global.
 
+local pqd_auth_cache_prefix = "pqd_auth"
+
 local BasePlugin = require "kong.plugins.base_plugin"
 local responses = require "kong.tools.responses"
 local http = require "resty.http"
@@ -17,6 +19,31 @@ local ProQuestAuthHandler = BasePlugin:extend()
 
 function ProQuestAuthHandler:new()
   ProQuestAuthHandler.super.new(self, "pq-auth")
+end
+
+--- Creates the key for caching PQD authentication call results.
+-- @param auth_key The auth key to be validated.
+--
+local function pqd_cache_key(auth_key)
+  return pqd_auth_cache_prefix .. ":" .. auth_key
+end
+
+--- Performs initialization tasks, including subscribing to change events for consumers.
+--
+function ProQuestAuthHandler:init_worker()
+  log.notice("In init_worker")
+  ProQuestAuthHandler.super.init_worker(self)
+  local worker_events = kong.worker_events
+
+  worker_events.register(function(data)
+    if data.operation ~= "create" then
+      log.notice("Invalidating cache for consumer: " .. dump(data.entity))
+      local consumer_cache_key = kong.db.consumers:cache_key(data.entity.username)
+      kong.cache:invalidate(consumer_cache_key)
+      local auth_cache_key = pqd_cache_key(data.entity.custom_id)
+      kong.cache:invalidate(auth_cache_key)
+    end
+  end, "crud", "consumers")
 end
 
 --- Sets consumer (Kong's concept of a user) header data.
@@ -41,23 +68,25 @@ end
 
 --- Queries the Kong database for the given user, creating a new entry if nothing is found.
 -- @param username The user to search for.
+-- @param auth_key The authentication key for the user.
 -- @param conf The plugin's configuration.
 -- @return The found or created consumer for the given user name.
 --
-local function load_or_create_consumer(username, conf)
-  kong.log.debug("Loading consumer for user " .. username)
+local function load_or_create_consumer(username, auth_key, conf)
+  kong.log.notice("Loading consumer for user " .. username)
   local found_consumer = kong.db.consumers:select_by_username(username)
 
   if not found_consumer then
     local inserted_consumer, err = kong.db.consumers:insert({
-      username = username
+      username = username,
+      custom_id = auth_key
     })
 
     if not inserted_consumer then
       return nil, err
     end
 
-    log.notice("Conf before inserting limiter: " .. dump(conf))
+    log.debug("Conf before inserting limiter: " .. dump(conf))
 
     local inserted_limiter, err = kong.dao.plugins:insert {
       name = "rate-limiting",
@@ -79,15 +108,23 @@ local function load_or_create_consumer(username, conf)
     return inserted_consumer
   end
 
+  if found_consumer.custom_id == purge_cache_custom_id then
+    return nil, error({
+      message = "Customer " .. found_consumer.username .. "should have its cache purged",
+      code = purge_cache_error_code
+    })
+  end
+
   return found_consumer
 end
 
 --- Gets the Kong consumer for the given user name.
 -- @param username The name of the user to fetch.
+-- @param auth_key The authentication key for the user.
 -- @param conf The plugin's configuration.
 -- @return The found or created consumer.
 --
-local function get_consumer_by_username(username, conf)
+local function get_consumer_by_username(username, auth_key, conf)
   local cache = kong.cache
 
   local consumer_cache_key = kong.db.consumers:cache_key(username)
@@ -95,7 +132,7 @@ local function get_consumer_by_username(username, conf)
   local cache_opts = { ttl = conf.cache_ttl_seconds, neg_ttl = conf.cache_neg_ttl_seconds }
 
   local consumer, err = cache:get(consumer_cache_key, cache_opts,
-    load_or_create_consumer, username, conf)
+    load_or_create_consumer, username, auth_key, conf)
 
   if err then
     kong.log.err(err)
@@ -105,7 +142,13 @@ local function get_consumer_by_username(username, conf)
   return consumer
 end
 
-local function do_authentication(conf, auth_header)
+--- Queries PQD auth server specified in `conf.url` using the given auth key.
+-- @param auth_key The key to query for.
+-- @param conf The plugin's configuration.
+--
+local function load_authentication(auth_key, conf)
+  log.notice("Loading authentication for " .. auth_key)
+
   local base_url
   if (helpers.ends_with(conf.url, "/")) then
     base_url = conf.url
@@ -113,7 +156,7 @@ local function do_authentication(conf, auth_header)
     base_url = conf.url .. "/"
   end
 
-  local pqd_url = base_url .. auth_header
+  local pqd_url = base_url .. auth_key
 
   log.debug("PQD URL: ", pqd_url)
 
@@ -140,21 +183,29 @@ local function do_authentication(conf, auth_header)
 
   local _, _, profile_name = auth_body:find('myResearchProfile>([^<]*)<')
   return helpers.strip(profile_name:gsub('/profile/', ''))
---  local token, err = retrieve_token(ngx.req, conf)
---  if err then
---    return responses.send_HTTP_INTERNAL_SERVER_ERROR(err)
---  end
+end
+
+--- Determines whether the given authentication key is valid, returning the user name
+-- associated with the key.
+-- @param auth_key The key to validate.
+-- @param conf The plugin's configuration.
 --
---  local ttype = type(token)
---  if ttype ~= "string" then
---    if ttype == "nil" then
---      return false, { status = 401 }
---    elseif ttype == "table" then
---      return false, { status = 401, message = "Multiple tokens provided" }
---    else
---      return false, { status = 401, message = "Unrecognizable token" }
---    end
---  end
+local function do_authentication(auth_key, conf)
+  local cache = kong.cache
+
+  local auth_cache_key = pqd_cache_key(auth_key)
+
+  local cache_opts = { ttl = conf.cache_ttl_seconds, neg_ttl = conf.cache_neg_ttl_seconds }
+
+  local user_name, err = cache:get(auth_cache_key, cache_opts,
+    load_authentication, auth_key, conf)
+
+  if err then
+    kong.log.err(err)
+    return nil, { status = 500, message = "Problems during authentication" }
+  end
+
+  return user_name
 end
 
 --- Authenticates the requesting user and adds user metadata to the request.
@@ -170,30 +221,30 @@ function ProQuestAuthHandler:access(conf)
     return responses.send_HTTP_BAD_REQUEST("No Authorization header")
   end
 
-  local auth_header = helpers.strip(string.gsub(auth_header, '[Bb][Ee][Aa][Rr][Ee][Rr]%s*', ''))
+  local auth_key = helpers.strip(string.gsub(auth_header, '[Bb][Ee][Aa][Rr][Ee][Rr]%s*', ''))
 
-  log.debug("Authentication header value: ", auth_header)
+  log.debug("Authentication header value: ", auth_key)
 
-  if helpers.isempty(auth_header) then
+  if helpers.isempty(auth_key) then
     return responses.send_HTTP_BAD_REQUEST("No Authorization header value")
   end
 
-  local username, err = do_authentication(conf, auth_header)
+  local username, err = do_authentication(auth_key, conf)
 
   if err then
-    return responses.send_HTTP_INTERNAL_SERVER_ERROR("Problems fetching credentials: " .. err)
+    return responses.send_HTTP_INTERNAL_SERVER_ERROR("Problems fetching credentials: " .. dump(err))
   end
 
-
-  local consumer, err = get_consumer_by_username(username, conf)
+  local consumer, err = get_consumer_by_username(username, auth_key, conf)
 
   if err then
-    return responses.send_HTTP_INTERNAL_SERVER_ERROR("Problems fetching consumer for " .. username .. ": " .. err)
+    return responses.send_HTTP_INTERNAL_SERVER_ERROR("Problems fetching consumer for " .. username .. ": " .. dump(err))
   end
 
   set_consumer(consumer)
 end
 
+-- Higher number is higher priority.  Most auth plugins start at 1000.
 ProQuestAuthHandler.PRIORITY = 1050
 
 return ProQuestAuthHandler
